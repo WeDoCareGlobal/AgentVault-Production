@@ -97,6 +97,21 @@ function migrate(db: DB) {
     CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_ledger(timestamp DESC);
     CREATE INDEX IF NOT EXISTS idx_calls_tool ON tool_calls(tool_name, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_calls_agent ON tool_calls(agent_uri, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS ephemeral_credentials (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL DEFAULT 'default',
+      agent_uri TEXT NOT NULL,
+      kid TEXT NOT NULL,
+      public_key_pem TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      revoked_at TEXT,
+      UNIQUE(tenant_id, kid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ephemeral_agent ON ephemeral_credentials(agent_uri);
+    CREATE INDEX IF NOT EXISTS idx_ephemeral_kid ON ephemeral_credentials(kid);
   `);
 }
 

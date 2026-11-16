@@ -81,6 +81,7 @@ program.command("doctor")
     console.log(`  Tool calls    : ${telemetry.summary().calls}`);
     console.log(`  Audit chain   : ${chain.ok ? "ok" : `BROKEN at seq ${chain.firstBadSeq}`}`);
     console.log(`  Master key    : ${usesDefaultKey ? "DEFAULT (dev only)" : "from AGENTVAULT_MASTER_KEY"}`);
+    console.log(`  mTLS          : ${process.env.AGENTGUARD_MTLS_ENABLED === "true" ? "enabled" : "disabled"}`);
     if (usesDefaultKey) {
       console.log("  ! Set AGENTVAULT_MASTER_KEY before storing real secrets.");
     }
@@ -376,11 +377,12 @@ program.command("serve")
   .option("--host <host>", "bind host", HOST)
   .action(async (opts) => {
     ensureDataDir();
+    const mtls = process.env.AGENTGUARD_MTLS_ENABLED === "true";
     const app = await buildApp({ dbPath: DB_PATH, masterPassphrase: MASTER, credentials: JSON.parse(process.env.AGENTVAULT_CREDENTIALS_JSON ?? "[]") });
     await app.listen({ port: Number(opts.port), host: opts.host });
     console.log(`\n  ${BRAND.product} v${BRAND.version}`);
     console.log(`  ${BRAND.org} - ORCID ${BRAND.orcid}`);
-    console.log(`  http://localhost:${opts.port}\n`);
+    console.log(`  ${mtls ? "https://" : "http://"}localhost:${opts.port}\n`);
   });
 
 program.parseAsync(process.argv).catch((err: Error & { body?: unknown }) => {

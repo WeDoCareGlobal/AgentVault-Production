@@ -1,15 +1,33 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, createPublicKey, timingSafeEqual } from "node:crypto";
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 We Do Care Global
 // Author: Emir Perla <emirperla96@gmail.com>  ORCID 0009-0009-8515-2727
 
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from "fastify";
 import cors from "@fastify/cors";
 import { openDb, ToolRegistry, newId } from "@we-do-care/agentvault-core";
 import { SecretVault, AuditLedger } from "@we-do-care/agentvault-vault";
 import { PolicyStore, evaluate, SlidingWindowCounter, can } from "@we-do-care/agentvault-governance";
 import { Telemetry } from "@we-do-care/agentvault-telemetry";
-import { AgentVaultError, BRAND, type Role, type Context, type TrustLevel, type PolicyRule } from "@we-do-care/agentvault-shared";
+import {
+  AgentVaultError,
+  BRAND,
+  type Role,
+  type Context,
+  type TrustLevel,
+  type PolicyRule,
+} from "@we-do-care/agentvault-shared";
+import {
+  loadMtlsConfig,
+  mtlsTlsOptions,
+  parseClientCert,
+  EphemeralStore,
+  EPHEMERAL_KEY_HEADER,
+  EPHEMERAL_SIGNATURE_HEADER,
+  EPHEMERAL_TIMESTAMP_HEADER,
+  buildCanonicalMessage,
+  type MtlsConfig,
+} from "./mtls.js";
 
 export interface Credential {
   token: string; subject: string; tenant: string; role: Role; context: Context;
@@ -21,6 +39,7 @@ export interface ServerConfig {
   masterPassphrase: string;
   tenant?: string;
   logger?: boolean;
+  mtls?: MtlsConfig;
 }
 
 const VALID_ROLES: Role[] = ["agent", "developer", "admin", "super_admin"];
@@ -46,24 +65,99 @@ export async function buildApp(cfg: ServerConfig): Promise<FastifyInstance> {
   const telemetry = new Telemetry(db, tenant);
   const limiter = new SlidingWindowCounter();
 
-  const app = Fastify({ logger: cfg.logger === false ? false : { level: "info", redact: ["req.headers.authorization"] } });
+  const mtls = cfg.mtls ?? loadMtlsConfig();
+  const ephemeral = mtls.enabled ? new EphemeralStore(db, tenant) : null;
+  const agentUris = new WeakMap<object, string>();
+
+  const fastifyOptions: Record<string, unknown> = {
+    logger: cfg.logger === false ? false : { level: "info", redact: ["req.headers.authorization"] },
+  };
+  if (mtls.enabled) {
+    fastifyOptions.https = mtlsTlsOptions(mtls);
+  }
+  const app = Fastify(fastifyOptions as unknown as FastifyServerOptions);
   await app.register(cors, { origin: false });
   const principals = new WeakMap<object, Credential>();
   app.addHook("onRequest", async (req, reply) => {
     const path = req.url.split("?")[0];
     if (["/health", "/ready", "/version"].includes(path)) return;
-    const header = req.headers.authorization;
-    if (!header?.startsWith("Bearer ") || header.length > 4096) return reply.code(401).send({ error: "unauthorized" });
-    const digest = createHash("sha256").update(header.slice(7)).digest();
-    const principal = credentials.find(c => timingSafeEqual(c.digest, digest));
-    if (!principal) return reply.code(401).send({ error: "unauthorized" });
-    if (principal.tenant !== tenant) return reply.code(403).send({ error: "tenant_mismatch" });
-    principals.set(req, principal);
-    const admin = ["admin", "super_admin"].includes(principal.role);
-    if (path !== "/v1/execute" && !(req.method === "GET" && path.startsWith("/v1/tools")) && !admin) {
-      return reply.code(403).send({ error: "admin_required" });
+
+    const isExecute = path === "/v1/execute" && req.method === "POST";
+    const isEphemeralCreds = mtls.enabled && path.startsWith("/v1/ephemeral");
+
+    if (mtls.enabled) {
+      // mTLS: every request must present a client certificate signed by the
+      // trusted CA (rejectUnauthorized at the TLS layer). Subject CN is the
+      // agent's Service Principal identity.
+      const agentUri = parseClientCert(req as { socket?: { getPeerCertificate?: () => unknown } });
+      if (!agentUri) return reply.code(401).send({ error: "mtls_client_cert_required" });
+      agentUris.set(req, agentUri);
+    }
+
+    if (!mtls.enabled || (!isExecute && !isEphemeralCreds)) {
+      // Bearer-token auth for all paths except /v1/execute in mTLS mode
+      // (ephemeral credentials take over authentication) and /v1/ephemeral/*
+      // (client certificate is sufficient to manage ephemeral keys).
+      const header = req.headers.authorization;
+      if (!header?.startsWith("Bearer ") || header.length > 4096) return reply.code(401).send({ error: "unauthorized" });
+      const digest = createHash("sha256").update(header.slice(7)).digest();
+      const principal = credentials.find(c => timingSafeEqual(c.digest, digest));
+      if (!principal) return reply.code(401).send({ error: "unauthorized" });
+      if (principal.tenant !== tenant) return reply.code(403).send({ error: "tenant_mismatch" });
+      principals.set(req, principal);
+      const admin = ["admin", "super_admin"].includes(principal.role);
+      if (path !== "/v1/execute" && !(req.method === "GET" && path.startsWith("/v1/tools")) && !admin) {
+        return reply.code(403).send({ error: "admin_required" });
+      }
     }
   });
+
+  // mTLS + ephemeral key verification for /v1/execute runs in preHandler so
+  // that req.body is already parsed and covered by the signed canonical
+  // message.
+  if (mtls.enabled && ephemeral) {
+    app.addHook("preHandler", async (req, reply) => {
+      const path = req.url.split("?")[0];
+      if (path !== "/v1/execute" || req.method !== "POST") return;
+
+      const agentUri = agentUris.get(req)!;
+      const kid = (req.headers[EPHEMERAL_KEY_HEADER] as string | undefined);
+      const signature = (req.headers[EPHEMERAL_SIGNATURE_HEADER] as string | undefined);
+      const timestamp = (req.headers[EPHEMERAL_TIMESTAMP_HEADER] as string | undefined);
+      if (!kid || !signature || !timestamp) {
+        return reply.code(401).send({ error: "ephemeral_credential_required" });
+      }
+      const now = Date.now();
+      const ts = Date.parse(timestamp);
+      if (Number.isNaN(ts) || Math.abs(now - ts) > mtls.toleranceSeconds * 1000) {
+        return reply.code(401).send({ error: "ephemeral_timestamp_stale" });
+      }
+      const { body = {} } = req;
+      const message = buildCanonicalMessage({ kid, timestamp, method: req.method, path, body: body ?? {} });
+      try {
+        const { agentUri: consumed, tenant: credTenant } = ephemeral!.consume(kid, signature, message);
+        if (consumed !== agentUri) {
+          audit.append(agentUri, "ephemeral.credential.mismatch", `ephemeral:${kid}`, {
+            certificate: agentUri,
+            credential: consumed,
+          });
+          return reply.code(403).send({ error: "ephemeral_identity_mismatch" });
+        }
+        if (credTenant !== tenant) {
+          audit.append(agentUri, "ephemeral.credential.tenant_mismatch", `ephemeral:${kid}`);
+          return reply.code(403).send({ error: "tenant_mismatch" });
+        }
+        audit.append(agentUri, "ephemeral.credential.consumed", `ephemeral:${kid}`, {
+          tool: (body as Record<string, unknown>)?.tool,
+        });
+        const roleCtx = mtls.principals?.[agentUri] ?? { role: "agent", context: "production" as Context };
+        principals.set(req, { token: `ephemeral:${kid}`, subject: agentUri, tenant, role: roleCtx.role, context: roleCtx.context });
+      } catch (err) {
+        audit.append(agentUri, "ephemeral.credential.rejected", `ephemeral:${kid}`, { reason: (err as Error).message });
+        throw err;
+      }
+    });
+  }
 
   // ---- health ----
   app.get("/health", async () => ({ status: "ok", service: BRAND.product, version: BRAND.version }));
@@ -243,6 +337,41 @@ export async function buildApp(cfg: ServerConfig): Promise<FastifyInstance> {
       governance: { policy_id: decision.policyId, decision: decision.decision, context, role },
     };
   });
+
+  if (mtls.enabled && ephemeral) {
+    app.post<{ Body: { public_key_pem: string; ttl_seconds?: number } }>(
+      "/v1/ephemeral/credentials",
+      async (req, reply) => {
+        const agentUri = agentUris.get(req)!;
+        const { public_key_pem, ttl_seconds } = req.body ?? {};
+        if (!public_key_pem || typeof public_key_pem !== "string") {
+          return reply.code(400).send({ error: "validation_error", message: "public_key_pem is required" });
+        }
+        try {
+          createPublicKey(public_key_pem);
+        } catch {
+          return reply.code(400).send({ error: "validation_error", message: "public_key_pem is not a valid public key" });
+        }
+        const cred = ephemeral.create(agentUri, public_key_pem, ttl_seconds);
+        audit.append(agentUri, "ephemeral.credential.created", `ephemeral:${cred.kid}`, { ttl_seconds });
+        return reply.code(201).send({ kid: cred.kid, expires_at: cred.expiresAt, agent_uri: cred.agentUri });
+      },
+    );
+
+    app.delete<{ Params: { kid: string } }>("/v1/ephemeral/credentials/:kid", async (req, reply) => {
+      const agentUri = agentUris.get(req)!;
+      const principal = principals.get(req);
+      const admin = principal ? ["admin", "super_admin"].includes(principal.role) : false;
+      const row = ephemeral.get(req.params.kid);
+      if (!row) return reply.code(404).send({ error: "not_found" });
+      if (row.agentUri !== agentUri && !admin) {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+      const ok = ephemeral.revoke(req.params.kid);
+      audit.append(agentUri, "ephemeral.credential.revoked", `ephemeral:${req.params.kid}`, { removed: ok });
+      return { status: ok ? "revoked" : "not_found" };
+    });
+  }
 
   // ---- audit ----
   app.get<{ Querystring: { limit?: string; offset?: string } }>("/v1/audit", async (req) => ({
